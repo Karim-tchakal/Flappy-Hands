@@ -1,22 +1,3 @@
-"""
-╔══════════════════════════════════════════════════════════╗
-║         FLAPPY BIRD  —  Hand Gesture Edition             ║
-║         1000×800  •  MediaPipe Tasks API                 ║
-╚══════════════════════════════════════════════════════════╝
-
-Requirements:
-    pip install -r requirements.txt
-
-Download model ONCE (place next to this script):
-    curl -o hand_landmarker.task \
-      "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
-
-Controls:
-    Pinch index + thumb  ->  flap
-    SPACE                ->  flap (fallback)
-    ESC                  ->  quit
-"""
-
 import pygame
 import cv2
 import mediapipe as mp
