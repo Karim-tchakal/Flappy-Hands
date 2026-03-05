@@ -50,9 +50,9 @@ ANGLE_DOWN_MAX = 80
 #  Pipes
 # -----------------------------------------------------------
 PIPE_W        = 72
-PIPE_GAP      = 250        # generous gap
-PIPE_SPEED    = 3.8
-PIPE_INTERVAL = 115
+PIPE_GAP      = 235        # generous gap
+PIPE_SPEED    = 4
+PIPE_INTERVAL = 80
 GROUND_H      = 110
 GROUND_Y      = GAME_H - GROUND_H
 
@@ -145,18 +145,26 @@ def make_stars(w, h, n=80):
         out.append((x, y, r, col, off))
     return out
 
-def draw_stars(surf, stars, tick):
-    for x, y, r, col, off in stars:
-        alpha = 0.5 + 0.5 * math.sin(tick * 0.04 + off)
-        c = lerp_color((25, 25, 55), col, alpha)
-        pygame.draw.circle(surf, c, (x, y), r)
+def make_star_frames(w, h, stars, n_frames=60):
+    """Pre-bake N star-twinkle frames so the main loop just blits one surface."""
+    frames = []
+    for f in range(n_frames):
+        surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        surf.fill((0, 0, 0, 0))
+        tick = f * (math.pi * 2 / n_frames)
+        for x, y, r, col, off in stars:
+            alpha = 0.5 + 0.5 * math.sin(tick * 2.4 + off)
+            c = lerp_color((25, 25, 55), col, alpha)
+            pygame.draw.circle(surf, c, (x, y), r)
+        frames.append(surf)
+    return frames
 
 def draw_outlined_text(surf, font, text, color, x, y, outline=3):
+    shadow = font.render(text, True, UI_SHADOW)
     for dx in range(-outline, outline+1):
         for dy in range(-outline, outline+1):
             if dx or dy:
-                s = font.render(text, True, UI_SHADOW)
-                surf.blit(s, (x+dx, y+dy))
+                surf.blit(shadow, (x+dx, y+dy))
     surf.blit(font.render(text, True, color), (x, y))
 
 # -----------------------------------------------------------
@@ -247,13 +255,16 @@ def new_pipe():
 # -----------------------------------------------------------
 #  Hand panel
 # -----------------------------------------------------------
-def draw_hand_panel(screen, landmarks, is_pinch, font_sm):
+def make_panel_base(is_pinch):
     panel = pygame.Surface((PANEL_W, PANEL_H), pygame.SRCALPHA)
     panel.fill((8, 8, 22, 220))
     bc = (80, 255, 120) if is_pinch else (60, 80, 180)
     pygame.draw.rect(panel, bc, (0, 0, PANEL_W, PANEL_H), 2, border_radius=10)
     pygame.draw.rect(panel, bc, (2, 2, PANEL_W-4, 1))
+    return panel
 
+def draw_hand_panel(screen, landmarks, is_pinch, font_sm, panel_base_normal, panel_base_pinch):
+    panel = (panel_base_pinch if is_pinch else panel_base_normal).copy()
     lbl = "  LANDMARKS  . PINCH!" if is_pinch else "  HAND LANDMARKS"
     tc  = (80, 255, 120) if is_pinch else (140, 170, 255)
     panel.blit(font_sm.render(lbl, True, tc), (8, 7))
@@ -393,12 +404,15 @@ def camera_picker(screen, clock):
 #  Gesture detector
 # -----------------------------------------------------------
 class GestureDetector:
-    PINCH_THRESHOLD = 0.07
+    PINCH_THRESHOLD = 0.067  # smaller = easier pinch (was 0.07)
+    CAM_W, CAM_H   = 320, 240 # low-res capture — much less CPU
+    TARGET_FPS     = 45        # cap detection rate
 
     def __init__(self, camera_index=0):
         self.pinch_detected = False
         self._prev_pinch    = False
         self.pinch_event    = threading.Event()
+        self._pinch_buf     = 0   # jump buffer: frames remaining to consume a queued jump
         self._lock          = threading.Lock()
         self._running       = True
         self._cap           = None
@@ -437,26 +451,46 @@ class GestureDetector:
         with self._lock:
             if is_p and not self._prev_pinch:
                 self.pinch_event.set()
+                self._pinch_buf = 6   # buffer: consume within 6 game frames
             self.pinch_detected = is_p
             self._prev_pinch    = is_p
             self.landmarks      = [(1.0 - p.x, p.y) for p in lm]
 
     def _run(self):
+        import time
         self._cap = cv2.VideoCapture(self._cam_idx)
         if not self._cap.isOpened():
             print(f"WARNING: Camera {self._cam_idx} unavailable. SPACE to play.")
             return
+        # Force low resolution — reduces decode cost dramatically
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.CAM_W)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.CAM_H)
+        self._cap.set(cv2.CAP_PROP_FPS, self.TARGET_FPS)
+
+        frame_interval = 1.0 / self.TARGET_FPS
         ts = 0
+        last_t = time.perf_counter()
         while self._running:
+            now = time.perf_counter()
+            elapsed = now - last_t
+            if elapsed < frame_interval:
+                time.sleep(frame_interval - elapsed)   # yield CPU
+            last_t = time.perf_counter()
+
             ret, frame = self._cap.read()
             if not ret:
                 continue
             rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            ts    += 33
+            ts    += int(frame_interval * 1000)
             self._recognizer.detect_async(mp_img, ts)
 
     def consume_pinch(self):
+        """Returns True if a pinch is queued (with 6-frame buffer window)."""
+        with self._lock:
+            if self._pinch_buf > 0:
+                self._pinch_buf -= 1
+                return True
         if self.pinch_event.is_set():
             self.pinch_event.clear()
             return True
@@ -489,15 +523,27 @@ def main():
 
     cam_idx = camera_picker(screen, clock)
 
-    sky_surf  = make_sky(GAME_W, GAME_H)
-    stars     = make_stars(GAME_W, GAME_H)
-    game_surf = pygame.Surface((GAME_W, GAME_H))
+    sky_surf    = make_sky(GAME_W, GAME_H)
+    stars       = make_stars(GAME_W, GAME_H)
+    star_frames = make_star_frames(GAME_W, GAME_H, stars)
+    game_surf   = pygame.Surface((GAME_W, GAME_H))
 
     sb_w     = GAME_X
     left_sb  = make_sidebar(sb_w,          WIN_H)
     right_sb = make_sidebar(WIN_W-GAME_X-GAME_W, WIN_H)
 
-    print("Starting gesture detector...")
+    # Pre-bake overlay cards (avoid per-frame Surface allocation)
+    title_card = pygame.Surface((GAME_W-60, 165), pygame.SRCALPHA)
+    title_card.fill((10, 12, 35, 210))
+    pygame.draw.rect(title_card, GOLD, (0,0,GAME_W-60,165), 2, border_radius=14)
+
+    dead_card = pygame.Surface((GAME_W-60, 175), pygame.SRCALPHA)
+    dead_card.fill((30, 5, 5, 215))
+    pygame.draw.rect(dead_card, RED_VIVID, (0,0,GAME_W-60,175), 2, border_radius=14)
+
+    panel_normal = make_panel_base(False)
+    panel_pinch  = make_panel_base(True)
+
     gesture = GestureDetector(camera_index=max(cam_idx, 0))
     if cam_idx < 0:
         print("Keyboard-only mode.")
@@ -599,7 +645,7 @@ def main():
 
         # ---- render game canvas ----
         game_surf.blit(sky_surf, (0, 0))
-        draw_stars(game_surf, stars, g["tick"])
+        game_surf.blit(star_frames[g["tick"] % len(star_frames)], (0, 0))
 
         for p in g["pipes"]:
             draw_pipe(game_surf, int(p["x"]), p["gap_top"], p["gap_bot"])
@@ -614,10 +660,7 @@ def main():
                            GAME_W//2 - sw//2, 18, outline=3)
 
         if g["state"] == "start":
-            card = pygame.Surface((GAME_W-60, 165), pygame.SRCALPHA)
-            card.fill((10, 12, 35, 210))
-            pygame.draw.rect(card, GOLD, (0,0,GAME_W-60,165), 2, border_radius=14)
-            game_surf.blit(card, (30, GAME_H//3 - 22))
+            game_surf.blit(title_card, (30, GAME_H//3 - 22))
 
             tw = f_big.size("FLAPPY BIRD")[0]
             draw_outlined_text(game_surf, f_big, "FLAPPY BIRD", GOLD,
@@ -631,10 +674,7 @@ def main():
                                    GAME_W//2-bw//2, GAME_H//3+90, outline=1)
 
         if g["state"] == "dead":
-            card = pygame.Surface((GAME_W-60, 175), pygame.SRCALPHA)
-            card.fill((30, 5, 5, 215))
-            pygame.draw.rect(card, RED_VIVID, (0,0,GAME_W-60,175), 2, border_radius=14)
-            game_surf.blit(card, (30, GAME_H//3 - 22))
+            game_surf.blit(dead_card, (30, GAME_H//3 - 22))
 
             gw = f_big.size("GAME  OVER")[0]
             draw_outlined_text(game_surf, f_big, "GAME  OVER", RED_VIVID,
@@ -660,7 +700,7 @@ def main():
 
         # hand landmark panel
         landmarks, is_pinch = gesture.get_landmarks()
-        draw_hand_panel(screen, landmarks, is_pinch, f_sm)
+        draw_hand_panel(screen, landmarks, is_pinch, f_sm, panel_normal, panel_pinch)
 
         # pinch indicator dot
         dot = (50,255,80) if is_pinch else (55,65,110)
